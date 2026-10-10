@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speed up strict JSON validation of unescaped ASCII strings while preserving byte limits, Unicode checks, and string-subclass isolation. (#1674)
 - Honor update-notifier opt-outs before resolving the cache path, avoiding Windows platform subprocess probes during offline CLI adoption. (#1664)
 - `brigade fleet cloud set` updates global and provider hosted-worker concurrency with administrator authorization. Limits persist across hub restarts and preserve omitted policy fields and active leases. The writer requires an upgraded hub, and explicit null policy limits are rejected. (#1576)
+- Fleet journal events use the same repository key as claims, so repositories sharing a home identity appear in separate status groups. Transient git failures retain event reporting with a workspace-name fallback warning. (#1662)
 
 - GrokBot treats replacement as the visible commit point for POSIX queue-storage writes, including rows, reports, snapshots, and authority markers. A later directory-fsync failure logs uncertain crash durability and reports success, preserving granted fleet and cloud claims. Failures before replacement still raise and release first-claim ownership. (#1660)
 - Add a local CRA actor and incident worksheet separating applicability, incident triggers, reporting deadlines, and actual filing evidence, with three synthetic drills. (#1625)
