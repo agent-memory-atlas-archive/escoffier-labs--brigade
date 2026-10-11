@@ -262,6 +262,53 @@ def test_idempotent_request_id_replays_without_second_transport_call(tmp_path):
         assert "keep going" not in json.dumps(event.payload)
 
 
+@pytest.mark.parametrize("accepted", [True, False], ids=["observed", "failed"])
+def test_relocated_control_events_report_the_run_owner(tmp_path, monkeypatch, accepted):
+    from brigade import fleet_client, node, proc, runguard
+
+    identity = node.NodeIdentity(
+        node_id="11111111-1111-4111-8111-111111111111", hostname="fleet-test", roles=(), platform="test"
+    )
+    home_identity = node.node_path(tmp_path)
+    home_identity.parent.mkdir()
+    home_identity.write_text(node._format_node_toml(identity))
+    monkeypatch.setenv("BRIGADE_HOME", str(home_identity.parent))
+    owner, artifacts = tmp_path / "owner", tmp_path / "artifacts"
+    for repo in (owner, artifacts):
+        repo.mkdir()
+        for args in (("init", "-q"), ("remote", "add", "origin", f"https://github.com/acme/{repo.name}.git")):
+            result = proc.run(["git", *args], cwd=repo)
+            assert result.code == 0, result.stderr
+    run_dir = _run_dir(artifacts / ".brigade")
+    _seed_lifecycle(run_dir)
+    (run_dir / "run.json").write_text(json.dumps({"status": "dispatching", "lock_workspace": str(owner)}))
+    reports = []
+    calls = []
+
+    def report(event, **kwargs):
+        reports.append(event)
+        return True
+
+    def send(payload):
+        calls.append(payload)
+        return {"ok": accepted}
+
+    monkeypatch.setenv("BRIGADE_FLEET_HUB_URL", "https://hub.example.invalid")
+    monkeypatch.setattr(fleet_client, "report_event", report)
+    with runguard.run_lock(owner, run_dir=run_dir):
+        first = run_control_journal.execute_control_request(run_dir, op="interrupt", request_id="relocated", send=send)
+        replay = run_control_journal.execute_control_request(run_dir, op="interrupt", request_id="relocated", send=send)
+
+    assert first.replayed is False and replay.replayed is True
+    assert len(calls) == 1
+    assert [event["state"] for event in reports] == [
+        "control.requested",
+        "control.observed" if accepted else "control.failed",
+    ]
+    assert fleet_client.resolve_claim_target(owner) == "acme/owner"
+    assert {event["repo"] for event in reports} == {"acme/owner"}
+
+
 @pytest.mark.parametrize(
     ("changed", "kwargs"),
     [

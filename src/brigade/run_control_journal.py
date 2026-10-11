@@ -208,13 +208,13 @@ def _load_run_snapshot(run_dir: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _preflight_live_control(run_dir: Path) -> None:
-    """Reject persisted terminal or unlocked runs before any control mutation."""
+def _preflight_live_control(run_dir: Path) -> Path | None:
+    """Reject terminal or unlocked runs and return the verified owner workspace."""
     snapshot = _load_run_snapshot(run_dir)
     # Journal-only runs predate persisted control metadata and remain readable
     # for compatibility. A persisted receipt, however, is authoritative.
     if snapshot is None:
-        return
+        return None
     status = snapshot.get("status")
     if (
         not isinstance(status, str)
@@ -223,10 +223,11 @@ def _preflight_live_control(run_dir: Path) -> None:
     ):
         raise ControlJournalError("control run is not live", code="control_run_not_live")
     if "lock_workspace" not in snapshot:
-        return
+        return None
     workspace = runguard.resolve_run_lock_workspace(snapshot, run_dir)
     if workspace is None or not runguard.has_active_run_owner(workspace, run_dir):
         raise ControlJournalError("control run owner is not active", code="control_owner_not_active")
+    return workspace
 
 
 def _sync_shadow_after_control(run_dir: Path) -> None:
@@ -247,6 +248,7 @@ def _append_control_event(
     journal_path: Path,
     *,
     run_dir: Path,
+    workspace: Path | None,
     run_id: str,
     event_type: str,
     payload: dict[str, Any],
@@ -271,6 +273,7 @@ def _append_control_event(
                         payload=payload,
                         idempotency_key=idempotency_key,
                         expected_previous_sequence=expected,
+                        workspace=workspace,
                     )
                 except run_journal.StaleSequenceError as exc:
                     last_error = exc
@@ -300,6 +303,7 @@ def _claim_control_request(
     journal_path: Path,
     *,
     run_dir: Path,
+    workspace: Path | None,
     run_id: str,
     request_id: str,
     fingerprint: Mapping[str, Any],
@@ -331,6 +335,7 @@ def _claim_control_request(
                         payload=terminal.payload,
                         idempotency_key=terminal.idempotency_key,
                         expected_previous_sequence=terminal.sequence,
+                        workspace=workspace,
                     )
                     return state, requested, terminal
                 if state != "absent":
@@ -343,6 +348,7 @@ def _claim_control_request(
                     payload=dict(fingerprint),
                     idempotency_key=requested_idempotency_key(request_id),
                     expected_previous_sequence=events[-1].sequence if events else 0,
+                    workspace=workspace,
                 )
                 _sync_shadow_after_control(run_dir)
                 return "claimed", requested, None
@@ -412,7 +418,7 @@ def execute_control_request(
     run_dir = Path(run_dir)
     if not journal_present(run_dir):
         raise ControlJournalError("legacy-no-journal", code="legacy-no-journal")
-    _preflight_live_control(run_dir)
+    workspace = _preflight_live_control(run_dir)
 
     resolved_id = request_id if request_id is not None else generate_request_id()
     fingerprint = control_fingerprint_payload(
@@ -439,6 +445,7 @@ def execute_control_request(
     state, prior_requested, prior_terminal = _claim_control_request(
         journal_path,
         run_dir=run_dir,
+        workspace=workspace,
         run_id=run_id,
         request_id=resolved_id,
         fingerprint=fingerprint,
@@ -492,6 +499,7 @@ def execute_control_request(
         terminal = _append_control_event(
             journal_path,
             run_dir=run_dir,
+            workspace=workspace,
             run_id=run_id,
             event_type=CONTROL_OBSERVED,
             payload=observed_payload,
@@ -525,6 +533,7 @@ def execute_control_request(
     terminal = _append_control_event(
         journal_path,
         run_dir=run_dir,
+        workspace=workspace,
         run_id=run_id,
         event_type=CONTROL_FAILED,
         payload=failed_payload,
