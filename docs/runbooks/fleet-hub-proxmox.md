@@ -642,3 +642,61 @@ systemctl start brigade-fleet.service
 ```
 
 If lock errors continue, check that the backup script is using `.backup` and not a second long-running writer, then review the CT disk and memory pressure.
+
+
+## External agent principals
+
+Upgrade the hub to schema 31 before enabling agent sends. Agents start with no
+send grants. A node may supply a display-only `--sender-label`. Agents cannot.
+Every new outbound agent message, including a reply, requires a matching send grant.
+
+Enroll using the administrator credential and stream the one-time token directly
+into a private file. Substitute an enrolled node ID for `example-node`. The token
+file must be owned by the invoking effective user where the platform exposes an
+effective user ID, have no group or other access, and contain only the token,
+with no trailing newline.
+
+```bash
+set -euo pipefail
+umask 077
+brigade fleet msg principals add example-agent --may-send-to example-node --json |
+  jq -j '.principal.token' > example-agent.token
+brigade fleet msg principals show example-agent --json
+brigade fleet msg list --token-file example-agent.token --json
+```
+
+`--token-file PATH` takes precedence over `BRIGADE_FLEET_MESSAGE_TOKEN_FILE`, then
+the node credential. Set the path only for message subprocesses. A token file does
+not require an enrolled node identity. Do not pass a token value in argv or an
+agent environment variable. Administrator credentials are refused for messaging.
+Use a stable `--client-id` when retrying a send or reply. Check acknowledgements
+with `brigade fleet msg sent --id MESSAGE_ID --token-file example-agent.token
+--json`, and drain that credential's queue with `brigade fleet msg flush
+--token-file example-agent.token --json`.
+
+Replace grants, clear send and reply permission, or revoke the credential:
+
+```bash
+brigade fleet msg principals grants example-agent --may-send-to example-node
+brigade fleet msg principals grants example-agent --clear
+brigade fleet msg principals revoke example-agent
+```
+
+Grants accept exact node IDs, exact `agent:NAME`, `node:*`, `agent:*`, or `*`.
+Agents cannot send to themselves. Each agent may have 200 unacknowledged
+messages per recipient, counting both initial sends and replies. The existing
+daily sender quota also applies. A grant change applies to new sends and replies.
+Replaying an accepted client ID returns its original message. Re-enrollment without grants clears previous grants.
+
+Without grants, `principals add` omits `may_send_to` so it can enroll against a
+schema 30 hub. If grants change after an enrollment whose local finalization
+failed, replay returns `principal_enrollment_grants_changed` (409) and clears the
+stale local retry record. Use `principals show` to inspect the current principal.
+Revoke before re-enrolling if a replacement credential is needed.
+
+While a message remains queued, retrying its client ID with the same payload
+returns the existing queued result. A different payload fails locally with
+`spool_conflict` and leaves the original message queued. Use `msg flush` to retry
+delivery. JSON errors have a non-null local code for token-file validation,
+admin-token refusal, client-ID validation, spool conflicts, and other invalid
+arguments. Transport failures use `hub_unavailable`.

@@ -22,6 +22,9 @@ MAX_LIST_RESPONSE_BYTES = 7 * 1024 * 1024
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 _PRINCIPAL_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{0,62}$")
+_SENDER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_THREAD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$")
+KINDS = frozenset({"message", "question", "completion"})
 _ENROLLMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _PRINCIPAL_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
@@ -38,6 +41,14 @@ _PRINCIPAL_SCHEMA = """CREATE TABLE IF NOT EXISTS fleet_message_principals (
 
 class MessageError(ValueError):
     """A bounded queue request was invalid."""
+
+
+class MessageForbidden(MessageError):
+    """A principal lacks permission for the requested recipient."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class MessageFutureTimestamp(MessageError):
@@ -74,10 +85,40 @@ class MessageAuthError(MessageError):
 
 
 def _payload_digest(
-    recipient: str, subject: str, body: str, reference: str | None, priority: str, reply_to: int | None = None
+    recipient: str,
+    subject: str,
+    body: str,
+    reference: str | None,
+    priority: str,
+    reply_to: int | None = None,
+    *,
+    extras: dict[str, str] | None = None,
 ) -> str:
-    value = json.dumps([recipient, subject, body, reference, priority, reply_to], ensure_ascii=False)
+    fields: list[Any] = [recipient, subject, body, reference, priority, reply_to]
+    if extras:
+        fields.append(extras)
+    value = json.dumps(fields, ensure_ascii=False)
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _metadata(raw: dict[str, Any], *, sender: str | None = None) -> dict[str, str]:
+    extras: dict[str, str] = {}
+    for field, pattern in (("sender_label", _SENDER_LABEL_RE), ("thread", _THREAD_RE)):
+        value = raw.get(field)
+        if value is None:
+            continue
+        if field == "sender_label" and sender is not None and sender.startswith("agent:"):
+            raise MessageError("sender_label is only available to node principals")
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            raise MessageError(f"{field} is invalid")
+        extras[field] = value
+    kind = raw.get("kind")
+    if kind is not None:
+        if not isinstance(kind, str) or kind not in KINDS:
+            raise MessageError("kind must be message, question, or completion")
+        if kind != "message":
+            extras["kind"] = kind
+    return extras
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -106,6 +147,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE fleet_messages ADD COLUMN payload_hash TEXT")
     if "received_at" not in columns:
         conn.execute("ALTER TABLE fleet_messages ADD COLUMN received_at TEXT")
+    for column in ("sender_label", "thread", "kind"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE fleet_messages ADD COLUMN {column} TEXT")
     conn.execute("UPDATE fleet_messages SET client_id='legacy-' || id WHERE client_id IS NULL")
     conn.execute("UPDATE fleet_messages SET received_at=created_at WHERE received_at IS NULL")
     rows = conn.execute(
@@ -136,6 +180,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "SELECT 1 FROM fleet_message_sends AS s WHERE s.sender=m.sender AND s.client_id=m.client_id)",
         (send_cutoff,),
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS fleet_messages_sender ON fleet_messages (sender, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS fleet_messages_inbox ON fleet_messages (recipient, id)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS fleet_messages_unacked_recipient "
@@ -148,6 +193,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS fleet_message_sends_received ON fleet_message_sends (received_at)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fleet_messages_sender_client ON fleet_messages (sender, client_id)")
+    from . import fleet_hub_message_grants
+
+    fleet_hub_message_grants.ensure_schema(conn)
     _prune_expired(conn)
 
 
@@ -224,13 +272,18 @@ def _row(row: tuple[Any, ...]) -> dict[str, Any]:
         "created_at",
         "acked_at",
         "acked_by",
+        "sender_label",
+        "thread",
+        "kind",
     )
-    return dict(zip(keys, row, strict=True))
+    result = dict(zip(keys, row, strict=True))
+    result["kind"] = result["kind"] or "message"
+    return result
 
 
 def _fetch(conn: sqlite3.Connection, message_id: int) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT id,sender,recipient,subject,body,reference,priority,client_id,reply_to,created_at,acked_at,acked_by "
+        "SELECT id,sender,recipient,subject,body,reference,priority,client_id,reply_to,created_at,acked_at,acked_by,sender_label,thread,kind "
         "FROM fleet_messages WHERE id=?",
         (message_id,),
     ).fetchone()
@@ -287,10 +340,13 @@ def _enqueued_at(value: Any) -> str:
     return stamp.isoformat()
 
 
-def add_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | None]:
-    allowed = {"name", "label", "request_id", "token", "expected_enrollment_id"}
+def add_principal(conn: sqlite3.Connection, raw: object) -> dict[str, Any]:
+    from . import fleet_hub_message_grants as grants
+
+    allowed = {"name", "label", "request_id", "token", "expected_enrollment_id", "may_send_to"}
     if not isinstance(raw, dict) or set(raw) - allowed:
         raise MessageError("principal enrollment requires only name and optional label")
+    patterns = grants.normalize_patterns(raw.get("may_send_to", []))
     name = _text(raw.get("name"), "name", 63)
     label = _text(raw.get("label", name), "label", 128)
     assert name is not None and label is not None
@@ -350,8 +406,14 @@ def add_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | None
         elif request_id is not None and existing[1] == request_id:
             if existing[2] != token_hash or existing[3] != label:
                 raise MessageConflict("request_id was already used for a different principal enrollment")
+            if grants.grants_for(conn, principal_id) != patterns:
+                raise MessageConflict(
+                    "principal send grants changed since enrollment. Inspect principals show or revoke before re-enrolling",
+                    code="principal_enrollment_grants_changed",
+                )
         else:
             raise MessageError("message principal already exists")
+        grants.replace_grants(conn, principal_id, patterns)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -362,6 +424,7 @@ def add_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | None
         "label": label,
         "token": secret,
         "enrollment_id": request_id,
+        "may_send_to": patterns,
     }
 
 
@@ -373,16 +436,28 @@ def lookup_principal_token(conn: sqlite3.Connection, presented: str) -> str | No
     return str(row[0]) if row else None
 
 
-def get_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | None] | None:
+def get_principal(conn: sqlite3.Connection, raw: object) -> dict[str, Any] | None:
+    from . import fleet_hub_message_grants as grants
+
     if not isinstance(raw, dict) or set(raw) != {"action", "name"} or raw.get("action") != "get":
         raise MessageError("principal lookup requires action='get' and name")
     name = _text(raw.get("name"), "name", 63)
     assert name is not None
     row = conn.execute(
-        "SELECT principal_id,name,enrollment_id FROM fleet_message_principals WHERE principal_id=?",
+        "SELECT principal_id,name,enrollment_id,revoked_at FROM fleet_message_principals WHERE principal_id=?",
         (f"agent:{name}",),
     ).fetchone()
-    return {"principal_id": str(row[0]), "name": str(row[1]), "enrollment_id": row[2]} if row else None
+    return (
+        {
+            "principal_id": str(row[0]),
+            "name": str(row[1]),
+            "enrollment_id": row[2],
+            "revoked": row[3] is not None,
+            "may_send_to": grants.grants_for(conn, str(row[0])),
+        }
+        if row
+        else None
+    )
 
 
 def revoke_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | None] | None:
@@ -423,6 +498,11 @@ def revoke_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | N
 
 
 def handle_principal_admin(conn: sqlite3.Connection, raw: object) -> tuple[int, dict[str, Any]]:
+    if isinstance(raw, dict) and raw.get("action") == "grants":
+        from .fleet_hub_message_grants import set_grants
+
+        principal = set_grants(conn, raw)
+        return (200, {"principal": principal}) if principal else (404, {"error": "principal not found"})
     if isinstance(raw, dict) and raw.get("action") == "get":
         principal = get_principal(conn, raw)
         return (200, {"principal": principal}) if principal else (404, {"error": "principal not found"})
@@ -430,13 +510,19 @@ def handle_principal_admin(conn: sqlite3.Connection, raw: object) -> tuple[int, 
         principal = revoke_principal(conn, raw)
         return (200, {"principal": principal}) if principal else (404, {"error": "principal not found"})
     if isinstance(raw, dict) and raw.get("action") not in (None, "add"):
-        raise MessageError("principal action must be add or revoke")
+        raise MessageError("principal action must be add, get, grants, or revoke")
     if isinstance(raw, dict) and "action" in raw:
         raw = {key: value for key, value in raw.items() if key != "action"}
     return 201, {"principal": add_principal(conn, raw)}
 
 
-def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to: int | None = None) -> dict[str, Any]:
+def send(
+    conn: sqlite3.Connection,
+    raw: dict[str, Any],
+    *,
+    sender: str,
+    reply_to: int | None = None,
+) -> dict[str, Any]:
     _prune_expired(conn)
     recipient = _text(raw.get("to"), "to", 256)
     subject = _text(raw.get("subject"), "subject", SUBJECT_LIMIT)
@@ -448,7 +534,8 @@ def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to
     if not isinstance(priority, str) or priority not in PRIORITIES:
         raise MessageError("priority must be low, normal, high, or urgent")
     assert recipient is not None and subject is not None and body is not None
-    message_hash = _payload_digest(recipient, subject, body, reference, priority, reply_to)
+    extras = _metadata(raw, sender=sender)
+    message_hash = _payload_digest(recipient, subject, body, reference, priority, reply_to, extras=extras)
     opened = not conn.in_transaction
     if opened:
         conn.execute("BEGIN IMMEDIATE")
@@ -465,6 +552,9 @@ def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to
             if opened:
                 conn.commit()
             return _fetch(conn, int(existing[0])) or {}
+        from .fleet_hub_message_grants import require_granted, require_recipient_cap
+
+        require_granted(conn, sender, recipient)
         if not _active_principal(conn, recipient):
             revoked = conn.execute(
                 "SELECT 1 FROM nodes WHERE node_id=? AND revoked_at IS NOT NULL "
@@ -475,6 +565,7 @@ def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to
             if revoked is not None:
                 raise MessageRecipientInactive("recipient is temporarily inactive", recipient=recipient)
             raise MessageError("recipient is not an active hub principal")
+        require_recipient_cap(conn, sender, recipient)
         count = conn.execute(
             "SELECT COUNT(*) FROM fleet_messages WHERE recipient=? AND acked_at IS NULL", (recipient,)
         ).fetchone()[0]
@@ -490,8 +581,8 @@ def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to
             raise MessageQuotaError("sender message quota exceeded", code="message_sender_quota")
         created_at = enqueued_at
         cursor = conn.execute(
-            "INSERT INTO fleet_messages(sender,recipient,subject,body,reference,priority,client_id,payload_hash,reply_to,created_at,received_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO fleet_messages(sender,recipient,subject,body,reference,priority,client_id,payload_hash,reply_to,created_at,received_at,sender_label,thread,kind) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sender,
                 recipient,
@@ -504,6 +595,9 @@ def send(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str, reply_to
                 reply_to,
                 created_at,
                 now.isoformat(),
+                extras.get("sender_label"),
+                extras.get("thread"),
+                extras.get("kind"),
             ),
         )
         message_id = cursor.lastrowid
@@ -532,12 +626,18 @@ def list_messages(conn: sqlite3.Connection, raw: dict[str, Any], *, recipient: s
     if not isinstance(unacked, bool):
         raise MessageError("unacked must be a boolean")
     rows = conn.execute(
-        "SELECT id,sender,recipient,subject,body,reference,priority,client_id,reply_to,created_at,acked_at,acked_by "
+        "SELECT id,sender,recipient,subject,body,reference,priority,client_id,reply_to,created_at,acked_at,acked_by,sender_label,thread,kind "
         "FROM fleet_messages WHERE recipient=? AND id>? "
         + ("AND acked_at IS NULL " if unacked else "")
         + "ORDER BY id LIMIT 100",
         (recipient, after),
     ).fetchall()
+    if opened:
+        conn.commit()
+    return _message_page(rows, after=after)
+
+
+def _message_page(rows: list[tuple[Any, ...]], *, after: int) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     serialized_messages_size = 0
     for row in rows:
@@ -552,9 +652,32 @@ def list_messages(conn: sqlite3.Connection, raw: dict[str, Any], *, recipient: s
             break
         messages.append(candidate)
         serialized_messages_size += separator_size + len(serialized_candidate)
-    if opened:
-        conn.commit()
     return {"messages": messages, "next_cursor": messages[-1]["id"] if messages else after}
+
+
+def sent(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str) -> dict[str, Any]:
+    _prune_expired(conn)
+    if set(raw) - {"action", "after", "ids"} or ("after" in raw and "ids" in raw):
+        raise MessageError("sent accepts either after or ids")
+    after = raw.get("after", 0)
+    if not _sqlite_integer(after, allow_zero=True):
+        raise MessageError("after must be a non-negative integer within SQLite's range")
+    params: list[Any] = [sender]
+    if "ids" in raw:
+        ids = raw["ids"]
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or not all(_sqlite_integer(i) for i in ids):
+            raise MessageError("ids must contain 1 to 100 positive integers within SQLite's range")
+        condition = "id IN (" + ",".join("?" for _ in ids) + ")"
+        params.extend(ids)
+    else:
+        condition = "id>?"
+        params.append(after)
+    rows = conn.execute(
+        "SELECT id,sender,recipient,subject,body,reference,priority,client_id,reply_to,created_at,acked_at,acked_by,"
+        "sender_label,thread,kind FROM fleet_messages WHERE sender=? AND " + condition + " ORDER BY id LIMIT 100",
+        params,
+    ).fetchall()
+    return _message_page(rows, after=after)
 
 
 def ack(conn: sqlite3.Connection, message_id: Any, *, recipient: str) -> dict[str, Any] | None:
@@ -588,7 +711,7 @@ def reply(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str) -> dict
         if not client_id:
             return None
         accepted = conn.execute(
-            "SELECT recipient,subject,reference,priority FROM fleet_messages "
+            "SELECT recipient,subject,reference,priority,thread FROM fleet_messages "
             "WHERE sender=? AND client_id=? AND reply_to IS NULL",
             (sender, client_id),
         ).fetchone()
@@ -610,6 +733,8 @@ def reply(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str) -> dict
                 "priority": raw.get("priority", accepted[3]),
                 "client_id": client_id,
                 "enqueued_at": raw.get("enqueued_at"),
+                "thread": raw.get("thread", accepted[4]),
+                **{field: raw[field] for field in ("sender_label", "kind") if field in raw},
             },
             sender=sender,
             reply_to=message_id,
@@ -636,6 +761,9 @@ def reply(conn: sqlite3.Connection, raw: dict[str, Any], *, sender: str) -> dict
             "priority": raw.get("priority", "normal"),
             "client_id": raw.get("client_id"),
             "enqueued_at": raw.get("enqueued_at"),
+            "thread": raw.get("thread", original["thread"]),
+            "sender_label": raw.get("sender_label"),
+            "kind": raw.get("kind"),
         },
         sender=sender,
         reply_to=message_id,
@@ -650,9 +778,9 @@ def handle(conn: sqlite3.Connection, raw: Any, *, caller: str | None) -> tuple[i
         raise MessageError("message request must be an object")
     action = raw.get("action")
     if action == "send":
-        if caller.startswith("agent:"):
-            return 403, {"error": "named external principals may reply to messages but may not start messages"}
         return 201, {"message": send(conn, raw, sender=caller)}
+    if action == "sent":
+        return 200, _as_active_principal(conn, caller, lambda: sent(conn, raw, sender=caller))
     if action == "list":
         return 200, _as_active_principal(conn, caller, lambda: list_messages(conn, raw, recipient=caller))
     if action == "ack":
@@ -661,4 +789,4 @@ def handle(conn: sqlite3.Connection, raw: Any, *, caller: str | None) -> tuple[i
     if action == "reply":
         message = _as_active_principal(conn, caller, lambda: reply(conn, raw, sender=caller))
         return (201, {"message": message}) if message else (404, {"error": "message not found"})
-    raise MessageError("action must be send, list, ack, or reply")
+    raise MessageError("action must be send, list, sent, ack, or reply")
