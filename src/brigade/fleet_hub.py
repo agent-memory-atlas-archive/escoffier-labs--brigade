@@ -106,6 +106,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import fleet_command_deck, fleet_hub_preference, worklore_store
+from .fleet_execution_context import serialize_context
 from .fleet_hub_event_bounds import oversized_event_field
 from .fleet_hub_server import BoundedThreadingHTTPServer
 from .fleet_hub_status import (
@@ -218,6 +219,7 @@ CREATE TABLE IF NOT EXISTS events (
     exit_status INTEGER,
     capability_fingerprint TEXT,
     repo_identity TEXT,
+    context TEXT,
     received_at TEXT NOT NULL,
     PRIMARY KEY (node_id, run_id, sequence, digest)
 );
@@ -260,7 +262,19 @@ _CLAIMS_ADDITIVE_COLUMNS = (
     "lock_acquired_at",
     "lock_run_dir",
 )
-_EVENTS_ADDITIVE_COLUMNS = ("exit_status", "capability_fingerprint", "repo_identity")
+_EVENTS_ADDITIVE_COLUMNS = ("exit_status", "capability_fingerprint", "repo_identity", "context")
+# Independently developed migrations can reserve the same schema version.
+# Register nullable additions here so current-version databases self-heal too.
+_ADDITIVE_COLUMNS = (("events", "context", "ALTER TABLE events ADD COLUMN context TEXT"),)
+
+
+def _missing_additive_columns(conn: sqlite3.Connection) -> list[str]:
+    return [
+        ddl
+        for table, column, ddl in _ADDITIVE_COLUMNS
+        if column not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    ]
+
 
 # Per-node credentials (schema v4, issue #1150): node_id -> SHA-256 of the
 # node's bearer token. The plaintext token is returned once by the add
@@ -635,8 +649,8 @@ def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
     ``database is locked``. A caller that loses the write lock treats
     "someone else already set user_version" as success.
 
-    A current ``user_version`` is accepted after a plain read so an
-    already-migrated database never takes the write lock (#1159). Request
+    A current ``user_version`` with all additive columns is accepted after
+    plain reads so a complete database never takes the write lock (#1159). Request
     handlers still use ``open_db`` (#1161); this path is for startup and
     other ``init_db`` callers (tools, tests, a first-touch storm).
     """
@@ -648,14 +662,15 @@ def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
             current = conn.execute("PRAGMA user_version").fetchone()[0]
             if current == SCHEMA_VERSION:
                 fleet_hub_claims.validate_schema(conn)
-                return
+                if not _missing_additive_columns(conn):
+                    return
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:
             if not _locked_operational_error(exc):
                 raise
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            if current == SCHEMA_VERSION:
+            if current == SCHEMA_VERSION and not _missing_additive_columns(conn):
                 fleet_hub_claims.validate_schema(conn)
                 return
             if delay is None:
@@ -665,6 +680,8 @@ def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
         try:
             _refuse_newer_schema(conn, db_path)
             if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+                for ddl in _missing_additive_columns(conn):
+                    conn.execute(ddl)
                 fleet_hub_claims.validate_schema(conn)
             else:
                 _apply_schema(conn)
@@ -674,7 +691,7 @@ def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
             if not _locked_operational_error(exc):
                 raise
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            if current == SCHEMA_VERSION:
+            if current == SCHEMA_VERSION and not _missing_additive_columns(conn):
                 fleet_hub_claims.validate_schema(conn)
                 return
             if delay is None:
@@ -847,9 +864,17 @@ def _validate_event(raw: Any) -> dict[str, Any]:
         event[field] = cleaned
     for field in OPTIONAL_EVENT_INT_FIELDS:
         value = raw.get(field)
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-            raise FleetHubError(f"event field {field!r} must be a non-negative integer")
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or not -(2**63) <= value < 2**63
+        ):
+            raise FleetHubError(f"event field {field!r} must be a signed 64-bit integer")
         event[field] = value
+    from .fleet_execution_context import ExecutionContextError, validate_context
+
+    try:
+        event["context"] = validate_context(raw["context"]) if raw.get("context") is not None else None
+    except ExecutionContextError as exc:
+        raise FleetHubUnprocessable(str(exc)) from None
     return event
 
 
@@ -885,7 +910,7 @@ def store_events(conn: sqlite3.Connection, raw_events: Any, *, caller_node: str 
         cursor = conn.execute(
             "INSERT OR IGNORE INTO events "
             "(node_id, run_id, sequence, digest, repo, seat, harness, state, ts, exit_status, "
-            "capability_fingerprint, repo_identity, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "capability_fingerprint, repo_identity, context, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event["node_id"],
                 event["run_id"],
@@ -899,6 +924,7 @@ def store_events(conn: sqlite3.Connection, raw_events: Any, *, caller_node: str 
                 event["exit_status"],
                 event["capability_fingerprint"],
                 event["repo_identity"],
+                serialize_context(event["context"]) if event["context"] is not None else None,
                 received_at,
             ),
         )

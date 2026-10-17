@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `brigade fleet events report` delivers or durably queues T3 lifecycle observations with stable replay digests and bounded execution context. Hub schema 32 preserves event history and exposes reported initiators and request correlation on fleet boards. Unknown or delayed observations do not appear as running. (Refs #1630, #1121)
+- Upgrade the hub before enabling t3-fleet reporting. T3 observations remain fresh for 900 seconds with a 300-second producer heartbeat. Permanent hub rejections return exit 2 without queueing. Older binaries refuse schema 32. For the nullable context-column migration alone, rollback can retain the column and set `PRAGMA user_version=31`. See [deployment and rollback instructions](docs/fleet-t3-events.md).
+
 - Grok Bot: new first-party connector pack `t3-dispatch` launches and steers T3 threads through `t3-fleet`, with a one-minute wake watcher.
 - `brigade fleet models set` accepts `--t3-model` and `--clear-t3-model` to bind the exact native model id T3 launches for a seat, next to `--t3-instance-id`. The t3-fleet plan binding then carries `model`, so seats whose canonical id differs from the native id (for example OpenCode `opencode/<model>`) launch through T3. The value requires a T3 instance binding, survives later `set` calls and fleet policy activation, and does not change the brigade-run plan. Hub schema 32 adds an additive `model_policy.t3_model` column.
 
