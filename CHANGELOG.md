@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Deck, fleet boards, and Center use shared spacing tokens derived from one scale while preserving existing layout sizes. Center navigation explicitly uses the shared Deck nav class. (#1495)
 - The dot connector pack connects a ChatGPT dot to T3 fleet dispatch, Brigade memory and the Fleet Hub inbox, with Cloudflare Access authentication and operator checks for setup and service health. (Refs #1765)
 
 - Fleet Hub refuses oversized or ambiguously framed JSON bodies, documents above the nesting and aggregate complexity budgets, and new acquisitions above 1024 active claims per node. Clients report claim quota refusals as definite failures, terminate the lease, and schedule fenced cleanup after an ambiguous acquire. The JSON complexity budget accepts producer-shaped Worklore import batches, with regex scans for string and numeric bodies. The claim count uses an index repaired on current-version databases without a schema version bump. Result-set bounds move to #1738. (#1151)
