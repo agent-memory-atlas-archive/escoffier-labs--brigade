@@ -873,7 +873,8 @@ def _print_claim_failure(decision, *, what: str) -> bool:
         print(f"error: {decision.detail}", file=sys.stderr)
         return True
     if not decision.granted and decision.reason not in ("held", "missing"):
-        print(f"error: fleet hub claim {what} refused: {decision.reason}", file=sys.stderr)
+        reason = f"active claim quota: {decision.detail or ''}" if decision.reason == "quota" else decision.reason
+        print(f"error: fleet hub claim {what} refused: {reason}", file=sys.stderr)
         return True
     return False
 
@@ -1104,7 +1105,7 @@ def _acquire_session(
         session=session,
         ttl_seconds=ttl if ttl is not None else fleet_client.DEFAULT_CLAIM_TTL_SECONDS,
     )
-    if _print_claim_failure(decision, what="acquire"):
+    if decision.reason != "quota" and _print_claim_failure(decision, what="acquire"):
         return 1
     if as_json:
         print(
@@ -1112,6 +1113,7 @@ def _acquire_session(
                 {
                     "target": target,
                     "granted": decision.granted,
+                    "reason": decision.reason,
                     "holder": decision.holder,
                     "claim": decision.claim,
                     "owner": decision.owner,
@@ -1127,6 +1129,8 @@ def _acquire_session(
             print(decision.holder or "")
         return 0
     if not as_json:
+        if _print_claim_failure(decision, what="acquire"):
+            return 1
         owner = (decision.owner or {}).get("owner_node") or "-"
         print(f"error: claim on {target!r} is held by node {owner}", file=sys.stderr)
     return 1

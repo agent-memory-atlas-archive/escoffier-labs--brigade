@@ -21,7 +21,7 @@ from tests._posix import requires_process_groups
 from tests.test_fleet_claims import NODE_A, NODE_B, _plant_home_identity
 
 
-def _mock_claim_loss(monkeypatch, pid_file, lost, loss_time):
+def _mock_claim_loss(monkeypatch, pid_file, lost, loss_time, refusal):
     def post(_hub, _token, body, *, timeout):
         if body["action"] == "acquire":
             return 200, {"granted": True, "claim": {"target": body["target"], "owner_node": NODE_A}}
@@ -32,6 +32,13 @@ def _mock_claim_loss(monkeypatch, pid_file, lost, loss_time):
             time.sleep(0.01)
         if not pid_file.exists():
             return 200, {"granted": True}
+        if refusal == "quota":
+            return 409, {
+                "renewed": False,
+                "reason": "claim-cardinality-exceeded",
+                "error": "active claim quota exceeded",
+                "owner": {},
+            }
         return 409, {"granted": False, "error": "held", "owner": {"owner_node": NODE_B, "expires_at": "soon"}}
 
     renew = fleet_client.renew_claim
@@ -40,7 +47,7 @@ def _mock_claim_loss(monkeypatch, pid_file, lost, loss_time):
         outcome = renew(*args, **kwargs)
         # Only the heartbeat's consumed decision may start the cancellation clock.
         # Abandoned HTTP threads can finish later without revoking ownership.
-        if outcome.reason == "held":
+        if outcome.reason == refusal:
             loss_time.append(time.monotonic())
             lost.set()
         return outcome
@@ -51,8 +58,9 @@ def _mock_claim_loss(monkeypatch, pid_file, lost, loss_time):
 
 @requires_process_groups
 @pytest.mark.parametrize("transport", ["local", "t3"])
-def test_claim_loss_stops_silent_worker_without_main_interrupt(tmp_path: Path, monkeypatch, transport):
-    _exercise_blocked_child(tmp_path, monkeypatch, transport)
+@pytest.mark.parametrize("refusal", ["held", "quota"])
+def test_claim_loss_stops_silent_worker_without_main_interrupt(tmp_path: Path, monkeypatch, transport, refusal):
+    _exercise_blocked_child(tmp_path, monkeypatch, transport, refusal=refusal)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows process-tree cancellation")
@@ -60,7 +68,7 @@ def test_native_windows_claim_loss_stops_silent_worker(tmp_path, monkeypatch):
     _exercise_blocked_child(tmp_path, monkeypatch, "local")
 
 
-def _exercise_blocked_child(tmp_path: Path, monkeypatch, transport):
+def _exercise_blocked_child(tmp_path: Path, monkeypatch, transport, *, refusal="held"):
     """The fallback kills only after the bound, so a queued interrupt cannot pass."""
     ws = tmp_path / "ws"
     (ws / ".brigade").mkdir(parents=True)
@@ -144,7 +152,7 @@ def _exercise_blocked_child(tmp_path: Path, monkeypatch, transport):
         )
         return build(**kwargs)
 
-    _mock_claim_loss(monkeypatch, pid_file, lost, loss_time)
+    _mock_claim_loss(monkeypatch, pid_file, lost, loss_time, refusal)
     monkeypatch.setattr(agents, "run_agent", run_agent)
     monkeypatch.setattr(t3, "build_source_transport", source_transport)
     monkeypatch.setattr(t3, "immutable_source_revision", lambda cwd, **kwargs: REVISION)
