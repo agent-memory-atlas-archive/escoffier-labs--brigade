@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The Command Deck opens on a Fleet overview: a left sidebar with the page nav, a machine tree, and cloud providers; four summary cards; an alerts strip with first-observed times; working and queued lists; and a machines table with seat and load bars. Deck pages and the fleet boards follow the system light or dark scheme. The routing snapshot gains an additive `node_id` per machine so stations join to machines by node id. Center stays dark for now.
+
 ## [0.28.0] - 2026-10-18
 
 - Background cleanup of an orphaned fleet claim keeps using the hub URL and token of the claim that scheduled it. Before, each retry re-read the fleet configuration, so a process whose configuration changed could send the cleanup request, with the new token, to a different hub. Renewal and exit release use the same bound connection. (Fixes #1778)
