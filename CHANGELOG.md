@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-18
+
 ### Changed
 
 - Verification reaps descendants that escape the process group on macOS when a run is canceled or times out.
@@ -2052,7 +2054,8 @@ Initial release.
 - OpenClaw adapter fragments and harness-aware doctor checks.
 - Experimental Hermes adapter fragments.
 
-[Unreleased]: https://github.com/escoffier-labs/brigade/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/escoffier-labs/brigade/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/escoffier-labs/brigade/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/escoffier-labs/brigade/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/escoffier-labs/brigade/compare/v0.26.1...v0.27.0
 [0.26.1]: https://github.com/escoffier-labs/brigade/compare/v0.26.0...v0.26.1
