@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fleet claim renewal and release follow node-token rotation on the bound hub, including orphan-release retries, while retaining the last node credential when its token file is temporarily unavailable.
+
 ### Added
 
 - Brigade agent plugin for Claude Code and Codex (`plugins/brigade/`): memory MCP tools, the `brigade-work` skill, a non-blocking SessionStart brief (Claude Code only), and an opt-in `enforce` skill.
