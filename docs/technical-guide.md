@@ -1956,3 +1956,52 @@ Each subsystem has a companion doc under [`docs/`](.) with the full local contra
 ## License
 
 MIT
+
+
+## Aggregate adoption statistics
+
+`brigade fleet stats collect` reads three fixed aggregate SELECT/WITH statements
+through the exact `wrangler d1 execute <configured-database> --remote --json
+--command <fixed-statement>` argv shape. There is no shell, user SQL or mutable
+Cloudflare command. With `fleet.stats.database_id` and `d1_token_env`, the same
+fixed statements use D1 REST with a D1 Read account token instead. Database date
+expressions bound reads to the last 90 days.
+Internal source observations are excluded. Optional Cloudflare GraphQL Analytics
+reads request and error totals by day over 30 completed UTC days. The optional public
+download-metrics JSON supplies matching 30-day PyPI and npm download counts.
+Unavailable providers stay unknown. If no source succeeds, collection exits 1
+without publishing. `--no-publish` prints a successful snapshot instead of
+posting it. Collection is explicit and no timer is installed.
+
+The closed `brigade.admin-stats.v1` snapshot and page expose these fields:
+
+- `schema`, `snapshot_id`, `taken_at`, `source_set`.
+- `weeks`, `daily`, `downloads`, `digest`.
+- `weeks.week`, `weeks.partial`, `weeks.active_sources`, `weeks.retained_2d_sources`.
+- `weeks.retained_3d_sources`, `weeks.versions`, `weeks.upgrades`, `weeks.versions.version`.
+- `weeks.versions.active_sources`, `weeks.upgrades.from_version`, `weeks.upgrades.to_version`, `weeks.upgrades.active_sources`.
+- `daily.day`, `daily.worker_requests`, `daily.worker_errors`, `downloads.pypi`.
+- `downloads.npm`.
+
+`weeks`, `daily`, version cells and upgrade cells are arrays. Counts are nullable
+nonnegative integers. Source counts below 5 become `null`, including zero.
+Weekly source counts are hidden together when any count is suppressed or
+subtraction, including excess version observations, would expose 1 to 4 sources.
+Incomplete version or upgrade reads hide both histograms. The Hub enforces
+suppression and rejects known subset counts that exceed their parent totals.
+The page renders `null` and missing observations as unknown. Worker request,
+Worker error and public download counts are event counts and may be zero.
+Weekly counts mean active sources, not people or installs. Retention is activity
+on 2+ or 3+ distinct days in the same ISO week. Possible upgrades pair versions
+observed in time order within a week, restricted to increasing numeric releases.
+The current week and the oldest week truncated by the 90-day query are labelled partial. Source identities rotate weekly.
+`source_set` contains only `d1`, `worker` and `downloads` for successful reads.
+`digest` is SHA-256 of canonical JSON without `digest` or `snapshot_id`, with
+sorted keys and compact separators. `snapshot_id` equals that digest.
+
+Controller and erasure contact: Solomon Neas through the project maintainer
+contact. No hashes, install IDs, addresses, hostnames or deployment identifiers
+enter snapshots. The Hub rejects unknown fields at every depth. It keeps only
+aggregate snapshots for 400 days and purges older rows on each accepted POST.
+Opt-in usage aggregates are not available yet. Future opt-in counts will
+undercount usage.
