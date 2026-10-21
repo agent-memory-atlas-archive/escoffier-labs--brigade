@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Claude work-loop hooks track explicit file reads and record unseen callers before Edit, Write, or NotebookEdit. Checks warn without denying edits, and unavailable or incomplete graphs record a null result with a reason.
+
 - Antigravity sessions publish Fleet Hub presence through silent, detached hooks installed by `brigade init --harnesses antigravity`; Stop refreshes presence until the session expires by TTL.
 - The `t3-dispatch` connector can read, acknowledge, reply to, send, and check Fleet Hub messages through an optional owner-only principal file. Its one-minute watcher wakes configured targets with message counts and sender ids, retries failed wakes, and keeps message bodies and subjects out of notifications.
 
