@@ -1143,6 +1143,10 @@ def handle(
                 conn, caller, lambda: _station_read(conn, raw, caller=caller, snapshot_write=True)
             )
         return 200, result
+    if action == "identity":
+        if set(raw) != {"action"}:
+            raise MessageError("identity accepts only action")
+        return 200, _as_active_principal(conn, caller, lambda: {"principal": caller}, read_only=True)
     if action == "reply" or (action == "send" and raw.get("reply_to") is not None):
 
         def insert_reply() -> dict[str, Any] | None:
@@ -1185,4 +1189,4 @@ def handle(
     if action == "ack":
         message = _as_active_principal(conn, caller, lambda: ack(conn, raw.get("id"), recipient=caller))
         return (200, {"message": message}) if message else (404, {"error": "message not found"})
-    raise MessageError("action must be send, list, sent, count, ack, reply, who, or claims")
+    raise MessageError("action must be send, list, sent, count, ack, reply, who, claims, or identity")
