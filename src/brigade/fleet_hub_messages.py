@@ -595,6 +595,9 @@ def revoke_principal(conn: sqlite3.Connection, raw: object) -> dict[str, str | N
             "WHERE principal_id=? AND enrollment_id IS ? AND revoked_at IS NULL",
             (datetime.now(timezone.utc).isoformat(), principal_id, expected_enrollment_id),
         )
+        from . import fleet_hub_message_keys
+
+        fleet_hub_message_keys.revoke(conn, principal_id)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -1130,18 +1133,53 @@ def handle(
         return fleet_hub_questions.handle(conn, raw, caller=caller, authenticated_generation=authenticated_generation)
     if isinstance(action, str) and action.startswith("events_"):
         return fleet_hub_events.handle(conn, raw, caller=caller)
+    if action in ("keys_publish", "keys_get", "manifests_get"):
+        from . import fleet_hub_identity, fleet_hub_message_keys
+
+        if action == "keys_publish":
+
+            def publish_key() -> dict[str, Any]:
+                if authenticated_generation is not None:
+                    from .fleet_hub_questions import _generation
+
+                    if not secrets.compare_digest(_generation(conn, caller), authenticated_generation):
+                        raise MessageAuthError("key publication credential generation changed")
+                return fleet_hub_message_keys.publish(conn, raw, caller=caller)
+
+            return 201, _as_active_principal(conn, caller, publish_key)
+
+        def read_mesh() -> dict[str, Any] | None:
+            if authenticated_generation is not None:
+                from .fleet_hub_questions import _generation
+
+                if not secrets.compare_digest(_generation(conn, caller), authenticated_generation):
+                    raise MessageAuthError("mesh read credential generation changed")
+            if action == "manifests_get":
+                return fleet_hub_identity.manifests(conn, raw)
+            return fleet_hub_message_keys.get(conn, raw, caller=caller)
+
+        result = _as_active_principal(conn, caller, read_mesh, read_only=True)
+        if action == "manifests_get":
+            return 200, result
+        return (200, result) if result else (404, {"error": "key not found"})
     if action in ("who", "claims"):
         from .fleet_hub_paging import SnapshotWriteRequired
 
+        def read_station(*, snapshot_write: bool = False) -> dict[str, Any]:
+            if authenticated_generation is not None:
+                from .fleet_hub_questions import _generation
+
+                if not secrets.compare_digest(_generation(conn, caller), authenticated_generation):
+                    raise MessageAuthError("station read credential generation changed")
+            return _station_read(conn, raw, caller=caller, snapshot_write=snapshot_write)
+
         try:
-            result = _as_active_principal(conn, caller, lambda: _station_read(conn, raw, caller=caller), read_only=True)
+            result = _as_active_principal(conn, caller, read_station, read_only=True)
         except SnapshotWriteRequired:
             # Small reads never take write admission. Rebuild a new snapshot
             # after BEGIN IMMEDIATE so its data and authorization are current,
             # and concurrent snapshot writers cannot race the storage caps.
-            result = _as_active_principal(
-                conn, caller, lambda: _station_read(conn, raw, caller=caller, snapshot_write=True)
-            )
+            result = _as_active_principal(conn, caller, lambda: read_station(snapshot_write=True))
         return 200, result
     if action == "identity":
         if set(raw) != {"action"}:

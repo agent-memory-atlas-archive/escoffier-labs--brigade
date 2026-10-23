@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Serve public mesh key history, live directory keys, and admin-supplied signed Hub identities and manifests without a crypto backend.
+
 ### Added
 
 - Live appserver controls accept explicit task and attempt IDs, keeping assignments on the same seat independently addressable. Ambiguous seat-name controls refuse before contacting a worker. Ordinary dispatch continues using legacy seat controls until task identity propagation is connected (#2049).
