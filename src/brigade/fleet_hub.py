@@ -88,16 +88,13 @@ digests. The database is one SQLite file in WAL mode with a versioned schema
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import hmac
-import ipaddress
 import os
 import re
 import secrets
 import sqlite3
 import stat
-import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -105,10 +102,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import fleet_command_deck, fleet_hub_events, fleet_hub_preference, worklore_campaigns, worklore_store
+from . import (
+    fleet_command_deck,
+    fleet_hub_events,
+    fleet_hub_preference,
+    fleet_hub_sealed,
+    worklore_campaigns,
+    worklore_store,
+)
 from .fleet_execution_context import serialize_context
 from .fleet_hub_event_bounds import oversized_event_field
-from .fleet_hub_server import BoundedThreadingHTTPServer
+from .fleet_hub_server import BoundedThreadingHTTPServer as BoundedThreadingHTTPServer
+from .fleet_hub_startup import _is_loopback_address as _is_loopback_address, _load_token as _load_token
 from .fleet_hub_status import (
     ACTIVE_EVENT_TTL_SECONDS as ACTIVE_EVENT_TTL_SECONDS,
     BOARD_LIMIT as BOARD_LIMIT,
@@ -266,6 +271,10 @@ _EVENTS_ADDITIVE_COLUMNS = ("exit_status", "capability_fingerprint", "repo_ident
 # Independently developed migrations can reserve the same schema version.
 # Register nullable additions here so current-version databases self-heal too.
 _ADDITIVE_COLUMNS = (
+    ("fleet_messages", "sealed_reply_to", "ALTER TABLE fleet_messages ADD COLUMN sealed_reply_to INTEGER"),
+    ("fleet_messages", "envelope", "ALTER TABLE fleet_messages ADD COLUMN envelope TEXT"),
+    ("fleet_messages", "envelope_bytes", "ALTER TABLE fleet_messages ADD COLUMN envelope_bytes INTEGER"),
+    ("fleet_messages", "content_state", "ALTER TABLE fleet_messages ADD COLUMN content_state TEXT"),
     ("events", "context", "ALTER TABLE events ADD COLUMN context TEXT"),
     ("model_policy", "t3_model", "ALTER TABLE model_policy ADD COLUMN t3_model TEXT NOT NULL DEFAULT ''"),
     ("fleet_events", "producer", fleet_hub_events.PRODUCER_COLUMN_DDL),
@@ -292,6 +301,10 @@ def _missing_additive_columns(conn: sqlite3.Connection) -> list[str]:
         for table, column, ddl in _ADDITIVE_COLUMNS
         if table not in created and column not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     )
+    if "sealed_reply_to" not in {row[1] for row in conn.execute("PRAGMA table_info(fleet_messages)")}:
+        missing.append(
+            "UPDATE fleet_messages SET sealed_reply_to=reply_to WHERE envelope IS NOT NULL AND reply_to IS NOT NULL"
+        )
     missing.extend(ddl for kind, ddl in absent if kind == "index")
     # Index repair shares the current-version self-heal transaction and its
     # read-only fast path. Claim fencing tables retain their strict validation.
@@ -300,6 +313,10 @@ def _missing_additive_columns(conn: sqlite3.Connection) -> list[str]:
         for name, ddl in _ADDITIVE_INDEXES
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)).fetchone() is None
     )
+    if ("index", "fleet_messages_sealed_acked") not in existing:
+        missing.append(
+            "CREATE INDEX IF NOT EXISTS fleet_messages_sealed_acked ON fleet_messages (acked_at,id) WHERE content_state='sealed'"
+        )
     from . import fleet_hub_questions
 
     missing.extend(fleet_hub_questions.missing_schema(conn))
@@ -578,7 +595,12 @@ def _migrate_claims_table(conn: sqlite3.Connection) -> None:
                     raise
 
 
-def _apply_schema(conn: sqlite3.Connection) -> None:
+def _apply_schema(
+    conn: sqlite3.Connection,
+    *,
+    storage_policy: fleet_hub_sealed.StoragePolicy | None = None,
+    prune_messages: bool = True,
+) -> None:
     """Create or upgrade every hub table. Caller holds BEGIN IMMEDIATE."""
     from . import fleet_hub_claims
 
@@ -677,7 +699,7 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
     # v26 -> v28 added messages and named principals; v28 -> v29 adds
     # recoverable principal enrollment and an unacked-recipient index.
     # v30 -> v31 adds message metadata columns and external agent send grants.
-    fleet_hub_messages.ensure_schema(conn)
+    fleet_hub_messages.ensure_schema(conn, storage_policy=storage_policy, prune_messages=prune_messages)
     from . import fleet_hub_questions
 
     # v42 -> v43: audited operator questions and terminal-answer trigger.
@@ -691,7 +713,8 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
     # v34 -> v36: aggregate snapshots and compact weekly administrator history.
     from . import fleet_admin_stats
 
-    fleet_admin_stats.ensure_schema(conn)
+    # Server schema setup defers destructive compaction until identity admission.
+    fleet_admin_stats.ensure_schema(conn, prune=prune_messages)
     from . import fleet_hub_actions
 
     fleet_hub_actions.ensure_schema(conn)
@@ -708,7 +731,13 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
-def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
+def _init_schema(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    *,
+    storage_policy: fleet_hub_sealed.StoragePolicy | None = None,
+    prune_messages: bool = True,
+) -> None:
     """Apply hub schema under BEGIN IMMEDIATE with locked-database backoff.
 
     Same-process callers already queue on ``_migration_lock``. Cross-process
@@ -754,7 +783,7 @@ def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
                 fleet_hub_events.ensure_schema(conn)
                 fleet_hub_claims.validate_schema(conn)
             else:
-                _apply_schema(conn)
+                _apply_schema(conn, storage_policy=storage_policy, prune_messages=prune_messages)
             conn.commit()
         except sqlite3.OperationalError as exc:
             conn.rollback()
@@ -872,7 +901,9 @@ def _secure_hub_database_storage(db_path: Path) -> None:
                 raise FleetHubError(f"could not secure fleet hub database file: {type(exc).__name__}") from exc
 
 
-def init_db(db_path: Path) -> sqlite3.Connection:
+def init_db(
+    db_path: Path, *, storage_policy: fleet_hub_sealed.StoragePolicy | None = None, prune_messages: bool = True
+) -> sqlite3.Connection:
     """Open the hub database and create/migrate its schema.
 
     Called once at server startup (``make_server``, before the socket serves
@@ -888,7 +919,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     try:
         conn.execute(f"PRAGMA busy_timeout={_INIT_BUSY_TIMEOUT_MS}")
         with _migration_lock(resolved):
-            _init_schema(conn, resolved)
+            _init_schema(conn, resolved, storage_policy=storage_policy, prune_messages=prune_messages)
         _secure_hub_database_storage(resolved)
     except BaseException:
         conn.close()
@@ -1828,34 +1859,6 @@ def handle_node_request(conn: sqlite3.Connection, raw: Any) -> tuple[int, dict[s
     return 200, {"revoked": True, "node": revoked}
 
 
-def _load_token(args: argparse.Namespace) -> str:
-    token = os.environ.get("BRIGADE_FLEET_TOKEN", "").strip()
-    if token:
-        return token
-    token_file = getattr(args, "token_file", None)
-    if token_file is not None:
-        try:
-            token = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise FleetHubError(f"could not read token file: {exc}") from exc
-        if token:
-            return token
-    raise FleetHubError("no fleet hub token: set BRIGADE_FLEET_TOKEN or pass --token-file")
-
-
-def _is_loopback_address(address: str) -> bool:
-    """True for IPv4, IPv6, and IPv4-mapped IPv6 loopback addresses."""
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    if parsed.is_loopback:
-        return True
-    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
-        return parsed.ipv4_mapped.is_loopback
-    return False
-
-
 def make_handler(
     token: str,
     db_path: Path,
@@ -1864,6 +1867,7 @@ def make_handler(
     deck_config: fleet_command_deck.DeckConfig | None = None,
     trust_tailscale_identity: bool = False,
     trust_forwarded_proto: bool = False,
+    storage_policy: fleet_hub_sealed.StoragePolicy | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build the HTTP adapter around the hub domain operations."""
     from .fleet_hub_http import make_handler as _make_handler
@@ -1875,6 +1879,7 @@ def make_handler(
         deck_config=deck_config,
         trust_tailscale_identity=trust_tailscale_identity,
         trust_forwarded_proto=trust_forwarded_proto,
+        storage_policy=storage_policy,
     )
 
 
@@ -1888,6 +1893,8 @@ def make_server(
     deck_config_path: Path | None = None,
     trust_tailscale_identity: bool = False,
     trust_forwarded_proto: bool = False,
+    storage_policy: fleet_hub_sealed.StoragePolicy | None = None,
+    require_sealed: bool = False,
 ) -> ThreadingHTTPServer:
     """Build (but do not serve) the hub HTTPServer; used by tests.
 
@@ -1899,29 +1906,19 @@ def make_server(
     socket is bound; an invalid file raises ``DeckConfigError`` without
     creating anything.
     """
-    if trust_forwarded_proto and not _is_loopback_address(host):
-        raise FleetHubError("--trust-forwarded-proto requires a numeric loopback --host")
-    if trust_tailscale_identity and not _is_loopback_address(host):
-        raise FleetHubError("--trust-tailscale-identity requires a loopback --host")
-    if deck_config_path is not None:
-        deck_config = fleet_command_deck.load_config(Path(deck_config_path))
-    else:
-        deck_config = fleet_command_deck.DeckConfig()
-    init_db(Path(db_path)).close()
-    from . import fleet_admin_stats
+    from .fleet_hub_startup import make_server as _make_server
 
-    fleet_admin_stats.maintain(Path(db_path).expanduser())
-    return BoundedThreadingHTTPServer(
-        (host, port),
-        make_handler(
-            token,
-            Path(db_path),
-            allow_admin_writes=allow_admin_writes,
-            deck_config=deck_config,
-            trust_tailscale_identity=trust_tailscale_identity,
-            trust_forwarded_proto=trust_forwarded_proto,
-        ),
-        db_path=Path(db_path),
+    return _make_server(
+        host,
+        port,
+        db_path,
+        token,
+        allow_admin_writes=allow_admin_writes,
+        deck_config_path=deck_config_path,
+        trust_tailscale_identity=trust_tailscale_identity,
+        trust_forwarded_proto=trust_forwarded_proto,
+        storage_policy=storage_policy,
+        require_sealed=require_sealed,
     )
 
 
@@ -1935,59 +1932,20 @@ def run(
     deck_config_path: Path | None = None,
     trust_tailscale_identity: bool = False,
     trust_forwarded_proto: bool = False,
+    storage_policy: fleet_hub_sealed.StoragePolicy | None = None,
+    require_sealed: bool = False,
 ) -> int:
-    if not host:
-        print("error: --host is required (the hub never binds all interfaces by default)", file=sys.stderr)
-        return 2
-    try:
-        token = _load_token(argparse.Namespace(token_file=token_file))
-    except FleetHubError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    try:
-        # MCP Events stay off unless the operator names callback hosts in the environment.
-        fleet_hub_events.configure(fleet_hub_events.config_from_environment(os.environ))
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    try:
-        server = make_server(
-            host,
-            port,
-            Path(db_path).expanduser(),
-            token,
-            allow_admin_writes=allow_admin_writes,
-            deck_config_path=deck_config_path,
-            trust_tailscale_identity=trust_tailscale_identity,
-            trust_forwarded_proto=trust_forwarded_proto,
-        )
-    except (FleetHubError, sqlite3.Error, fleet_command_deck.DeckConfigError) as exc:
-        # Startup migration is the one place the hub touches the schema: if
-        # it cannot be done, refuse to serve rather than 500-ing every request.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    bound_host, bound_port = str(server.server_address[0]), int(server.server_address[1])
-    mode = "admin writes allowed" if allow_admin_writes else "node tokens required for writes"
-    tailscale_mode = "tailscale identity trusted" if trust_tailscale_identity else "tailscale identity ignored"
-    print(
-        f"brigade fleet hub listening on {bound_host}:{bound_port} (db {Path(db_path).expanduser()}; {mode}; {tailscale_mode})"
+    from .fleet_hub_startup import run as _run
+
+    return _run(
+        host=host,
+        port=port,
+        db_path=db_path,
+        token_file=token_file,
+        allow_admin_writes=allow_admin_writes,
+        deck_config_path=deck_config_path,
+        trust_tailscale_identity=trust_tailscale_identity,
+        trust_forwarded_proto=trust_forwarded_proto,
+        storage_policy=storage_policy,
+        require_sealed=require_sealed,
     )
-    from . import fleet_admin_stats, fleet_hub_grokbot
-
-    sweeper_stop = threading.Event()
-    sweeper_thread = fleet_hub_grokbot.start_expiry_sweeper(Path(db_path).expanduser(), stop=sweeper_stop)
-    from .fleet_hub_events_dispatch import start_dispatcher
-
-    events_thread = start_dispatcher(Path(db_path).expanduser(), sweeper_stop)
-    stats_thread = fleet_admin_stats.start_retention_sweeper(Path(db_path).expanduser(), stop=sweeper_stop)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sweeper_stop.set()
-        sweeper_thread.join(timeout=5)
-        stats_thread.join(timeout=5)
-        events_thread.join(timeout=5)
-        server.server_close()
-    return 0

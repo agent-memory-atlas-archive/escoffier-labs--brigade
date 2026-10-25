@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Store sealed Hub messages with retry lookup, post-ack content purge, storage quotas, and optional required sealing (#2045).
 - Pre-push history scans exclude commits verified already published on the actual destination for existing branches as well as new branches, and reject stale or unverifiable destination evidence.
 
 - Patrol detects suspected mass environment faults before repairs and reports failure for unforced apply passes, including escalation-only passes (#1975).
