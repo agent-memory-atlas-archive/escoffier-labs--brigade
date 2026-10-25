@@ -286,6 +286,7 @@ _FSTRING_POSITION = re.compile(r"(?:^|=|(?:^|;)\s*return|\w\(|[=(]\s*[\[{])\s*$"
 # The rest of a field after its expression: '=', a conversion, a format spec
 # with at most simple nested fields, then the closing brace.
 _FIELD_CLOSE = re.compile(r"""\s*=?\s*(?:![rsa])?(?::(?:[^{}"'\n]|\{[A-Za-z_][\w.]*\})*)?\}""")
+_HOSTNAME_KEY = r"(?:[a-z][a-z0-9]*[_-])*(?:host|hostname|server|endpoint|domain|url|address)"
 
 
 def _whole_fstring_field(before: str, after: str) -> bool:
@@ -307,6 +308,118 @@ def _whole_fstring_field(before: str, after: str) -> bool:
     if stem.lstrip().startswith(_LINE_START_COMMENT_PREFIXES) or _quote_at(stem, match.start(), None) is not None:
         return False
     return _quote_at(stem, len(stem), None) is not None and bool(_FIELD_CLOSE.match(after))
+
+
+def _hostname_option_context(before: str, after: str) -> bool:
+    """Recognize this option's command context, not every later shell argument."""
+    if not re.search(r"(?:^|\s)--?" + _HOSTNAME_KEY + r"=\s*$", before, re.IGNORECASE):
+        return False
+    # Retain the original simple-option recall, including argument punctuation.
+    if not re.search(r"[(){}\[\];]", before) and not re.match(r"\s*[,)}\];]", after):
+        return True
+    if re.match(r"\s*,", after):
+        return False
+    line = before + "hostname" + after
+    masked = list(line)
+    quote: str | None = None
+    escaped = False
+    word_boundary = True
+    for index, char in enumerate(line):
+        if escaped:
+            masked[index] = "x"
+            escaped = False
+            word_boundary = False
+        elif char == "\\" and quote != "'":
+            masked[index] = "x"
+            escaped = True
+            word_boundary = False
+        elif quote is not None:
+            masked[index] = "x"
+            word_boundary = False
+            if char == quote:
+                quote = None
+        elif char in "\"'`":
+            masked[index] = "x"
+            quote = char
+            word_boundary = False
+        elif char == "#" and word_boundary:
+            masked[index:] = " " * (len(line) - index)
+            break
+        else:
+            word_boundary = char.isspace()
+    tokens = list(re.finditer(r"\$\(|&&|\|\||[();{}|&]|[^\s();{}|&$]+|\$(?!\()", "".join(masked)))
+    # A complete earlier word expansion is argument data. Balance delimiters
+    # lexically without interpreting parameter or arithmetic expressions.
+    pairs: dict[int, int] = {}
+    openings: list[tuple[str, int]] = []
+    for index, token in enumerate(tokens):
+        value = token.group()
+        if value in {"(", "$(", "{"}:
+            openings.append(("}" if value == "{" else ")", index))
+        elif value in {")", "}"}:
+            if openings and openings[-1][0] == value:
+                pairs[openings.pop()[1]] = index
+            else:
+                openings.clear()
+    words: list[str] = []
+    groups: list[tuple[str, list[str], bool, bool]] = []
+    bracket_in_command = False
+    found = False
+    previous = ""
+    skip_until = -1
+    for index, token in enumerate(tokens):
+        if index <= skip_until:
+            continue
+        value = token.group()
+        expansion = value == "$(" or (value == "{" and line[max(0, token.start() - 1) : token.start()] == "$")
+        if not found and expansion:
+            closing = pairs.get(index)
+            if closing is not None and tokens[closing].end() <= len(before):
+                words.append("word")
+                previous = "word"
+                skip_until = closing
+                continue
+            if value == "{" or line[token.start() : token.start() + 3] == "$((":
+                return False  # The option itself is inside an expression.
+        if value in {"(", "$(", "{"}:
+            if not found and value != "$(" and words:
+                return False  # callback( ... ) and callback ( ... ) are calls.
+            if not found and value == "{" and (token.end() == len(line) or not line[token.end()].isspace()):
+                return False
+            groups.append((value, words, not found, bracket_in_command))
+            words = []
+            bracket_in_command = False
+        elif value in {")", "}"}:
+            if not groups:
+                return False
+            opening, outer_words, enclosing, outer_bracket = groups.pop()
+            if (value == "}") != (opening == "{"):
+                return False
+            if enclosing and value == "}" and previous not in {";", "&"}:
+                return False
+            if not words and previous not in {")", "}", ";", "&"}:
+                return False
+            words = outer_words + ["group"]
+            bracket_in_command = outer_bracket
+            if found and not groups:
+                return True  # Later commands cannot invalidate this context.
+        elif value in {";", "&&", "||", "|", "&"}:
+            if not words:
+                return False
+            words = []
+            bracket_in_command = False
+        else:
+            if not found and re.search(r"[\[\]]", value):
+                bracket_in_command = True
+            if token.start() <= len(before) < token.end():
+                if bracket_in_command:
+                    return False
+                found = True
+                if not groups:
+                    return not bool(re.match(r"\s*[,)}\]]", after))
+            words.append(value)
+        previous = value
+    return False
 
 
 def _hostname_context(text: str, start: int, end: int) -> bool:
@@ -345,10 +458,14 @@ def _hostname_context(text: str, start: int, end: int) -> bool:
     # Host-related assignment keys behind shell declaration prefixes
     # (export/readonly, and Windows batch set) are still configuration (#1920).
     if re.fullmatch(
-        r"\s*(?:(?:export|readonly|set)\s+)*(?:[a-z][a-z0-9]*[_-])*(?:host|hostname|server|endpoint|domain|url|address)\s*[:=]\s*",
+        r"\s*(?:(?:export|readonly|set)\s+)*" + _HOSTNAME_KEY + r"\s*[:=]\s*",
         before,
         re.IGNORECASE,
     ):
+        return True
+    # Separators and balanced shell groups bound the active option; punctuation
+    # inside earlier arguments must not hide it or turn a call into a command.
+    if _hostname_option_context(before, after):
         return True
     if re.search(r"[(){}\[\];=]|\b(?:return|const|let|var|assert|import)\b", before):
         return False
