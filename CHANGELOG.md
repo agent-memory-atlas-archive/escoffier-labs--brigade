@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The content guard no longer flags a private hostname in a formatted URL when an f-string replacement field holds only that expression, such as `f"https://{cfg.db.host}/path"`; every other URL, prose, string, and configuration hostname is still detected.
 
 - Fleet claim renewal and release follow node-token rotation on the bound hub, including orphan-release retries, while retaining the last node credential when its token file is temporarily unavailable.
+- The content guard detects bare AWS temporary access keys, Google API keys, and GitLab personal access tokens while preserving assignment and Bearer detector precedence.
 
 ### Added
 
