@@ -422,6 +422,86 @@ def _hostname_option_context(before: str, after: str) -> bool:
     return False
 
 
+def _normalized_shell_assignments(before: str) -> str:
+    """Treat complete declaration assignment values as opaque shell words."""
+    if not re.match(r"\s*(?:-[ \t]+)?(?:export|readonly|declare|local|@?set)\b", before, re.IGNORECASE):
+        return before
+
+    def closed(index: int, delimiter: str) -> int | None:
+        delimiters = [delimiter]
+        while index < len(before):
+            delimiter = delimiters[-1]
+            char = before[index]
+            if char == delimiter:
+                delimiters.pop()
+                index += 1
+                if not delimiters:
+                    return index
+                continue
+            if delimiter == "'":
+                index += 1
+                continue
+            if char == "\\":
+                index += 2
+                continue
+            nested = None
+            width = 1
+            if before.startswith("${", index):
+                nested, width = "}", 2
+            elif before.startswith("$(", index):
+                nested, width = ")", 2
+            elif char in "\"'`" and not (delimiter == '"' and char == "'"):
+                nested = char
+            elif char == "(" and delimiter == ")":
+                nested = delimiter
+            if nested is not None:
+                delimiters.append(nested)
+                index += width
+            else:
+                index += 1
+        return None
+
+    pieces: list[str] = []
+    position = 0
+    for assignment in re.finditer(r"(?<!\S)[a-z_][a-z0-9_]*=", before, re.IGNORECASE):
+        if assignment.start() < position:
+            continue
+        index = assignment.end()
+        while index < len(before) and not before[index].isspace():
+            char = before[index]
+            nested = None
+            width = 1
+            if before.startswith("${", index):
+                nested, width = "}", 2
+            elif before.startswith("$(", index):
+                nested, width = ")", 2
+            elif char in "\"'`":
+                nested = char
+            elif char == "\\":
+                if index + 1 == len(before):
+                    return before
+                index += 2
+                continue
+            # Attached braces are shell word data, including any brace left
+            # after a parameter expansion closes. Command operators are not.
+            elif char in ";|&()":
+                return before
+            if nested is not None:
+                parsed = closed(index + width, nested)
+                if parsed is None:
+                    return before
+                index = parsed
+            else:
+                index += 1
+        pieces.append(before[position : assignment.end()])
+        # Every successfully consumed word is opaque, including literal braces.
+        # Keep the final empty host assignment open for the hostname matcher.
+        pieces.append("value" if index > assignment.end() else "")
+        position = index
+    pieces.append(before[position:])
+    return "".join(pieces)
+
+
 def _hostname_context(text: str, start: int, end: int) -> bool:
     """Keep textual hosts while avoiding unquoted attribute expressions.
 
@@ -439,7 +519,7 @@ def _hostname_context(text: str, start: int, end: int) -> bool:
         return not _whole_fstring_field(before, after)
     # These delimiters introduce expressions, including expressions inside
     # interpolated strings. Check them before accepting a surrounding quote.
-    if re.search(r"\bf[\"'][^\n]*\{[^}]*$", before, re.IGNORECASE):
+    if re.search(r"\bf[\"'][^\n]*\{[^}]*$", _normalized_shell_assignments(before), re.IGNORECASE):
         return False
     if before.rstrip().endswith(("[", "{")):
         return False
@@ -447,7 +527,8 @@ def _hostname_context(text: str, start: int, end: int) -> bool:
         return True
     # Prose punctuation is valid around a host, including commas and
     # parenthesized examples. An identifier immediately before '(' is a call.
-    if re.search(r"\b(?:return|if|const|let|var|assert|import)\b", before):
+    # Complete earlier shell assignment words are opaque to code keywords.
+    if re.search(r"\b(?:return|if|const|let|var|assert|import)\b", _normalized_shell_assignments(before)):
         return False
     if re.fullmatch(r"\s*(?:[a-z]+[,:]?\s+)+(?:\(\s*)?", before, re.IGNORECASE):
         return True
@@ -459,8 +540,12 @@ def _hostname_context(text: str, start: int, end: int) -> bool:
     # prefixes (export/readonly, and Windows batch set) are configuration.
     # Require whitespace after '-' so a hyphenated key is not a sequence item.
     if re.fullmatch(
-        r"\s*(?:-[ \t]+)?(?:(?:export|readonly|set)\s+)*" + _HOSTNAME_KEY + r"\s*[:=]\s*",
-        before,
+        r"\s*(?:-[ \t]+)?(?:(?:(?:export|readonly|declare|(?P<local_declaration>local))(?:[ \t]+-[a-z]+)*"
+        r"|@?set(?:[ \t]+/a)?)[ \t]+"
+        r"(?:[a-z_][a-z0-9_]*=(?:[^\s\"'`;|&(){}]|'[^'\r\n]*'|\"[^\"\r\n]*\")*[ \t]+)*)*"
+        + _HOSTNAME_KEY
+        + r"(?(local_declaration)=|\s*[:=]\s*)",
+        _normalized_shell_assignments(before),
         re.IGNORECASE,
     ):
         return True
