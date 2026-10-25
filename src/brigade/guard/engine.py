@@ -455,10 +455,11 @@ def _hostname_context(text: str, start: int, end: int) -> bool:
         return False
     if re.match(r"\s*(?:=|\?)", after):
         return False
-    # Host-related assignment keys behind shell declaration prefixes
-    # (export/readonly, and Windows batch set) are still configuration (#1920).
+    # Host-related keys after a YAML sequence marker or shell declaration
+    # prefixes (export/readonly, and Windows batch set) are configuration.
+    # Require whitespace after '-' so a hyphenated key is not a sequence item.
     if re.fullmatch(
-        r"\s*(?:(?:export|readonly|set)\s+)*" + _HOSTNAME_KEY + r"\s*[:=]\s*",
+        r"\s*(?:-[ \t]+)?(?:(?:export|readonly|set)\s+)*" + _HOSTNAME_KEY + r"\s*[:=]\s*",
         before,
         re.IGNORECASE,
     ):

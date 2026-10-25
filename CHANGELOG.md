@@ -65,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The content guard detects bare AWS temporary access keys, Google API keys, and GitLab personal access tokens while preserving assignment and Bearer detector precedence.
 - Content guard matches and redacts complete quoted root-home paths with spaces in directory or file names, preserving the quotes and surrounding prose.
 - The content guard detects and redacts private hostnames in equals-form host options, including single- and double-hyphen options and compound host-related keys, while preserving code-expression and arbitrary-assignment skips.
+- The content guard recognizes host-related keys after YAML sequence markers, including indented items and compound keys, while preserving its code-expression and public-suffix skips.
 
 
 ### Added
