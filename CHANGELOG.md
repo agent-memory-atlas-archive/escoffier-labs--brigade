@@ -8,11 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Patrol detects suspected mass environment faults before repairs and reports failure for unforced apply passes, including escalation-only passes (#1975).
-- Receipt telemetry documents every exported attribute and distinguishes requested and effective OpenInference model names while preserving content privacy (#1978).
 - Grok can opt into Hub messaging to configured aliases while T3 tools remain available independently.
 - Serve public mesh key history, live directory keys, and admin-supplied signed Hub identities and manifests without a crypto backend.
 
 ### Added
+
+- `brigade model trial run|resume --retry-transient` re-runs `adapter_error` and timeout-reason `execution_error` cells as new attempts (caps: 2 and 1), keeping each failed attempt in the cell's `prior_attempts` record. Deterministic results are never retried.
+- `brigade model trial drain <output-dir>` and the first SIGINT or SIGTERM to a running trial stop it from launching new cells while in-flight cells finish and record results. Unlaunched cells are recorded as `not_run` (not a failure), `resume` launches them, and an incomplete trial exits 4.
+- A structured provider quota or capacity response (`capacity-exhausted`) during a model trial is recorded as the cell's `failure_reason` on an `adapter_error` cell, not scored as a model failure and never retried as transient. The runner launches no more cells for that seat and records them as `not_run`.
 
 - A programmatic assignment journal records stable task and attempt identities, classified result references, and result-consumption acknowledgements under the existing run owner. It does not dispatch work or retry uncertain attempts (#2049).
 - Live appserver controls accept explicit task and attempt IDs, keeping assignments on the same seat independently addressable. Ambiguous seat-name controls refuse before contacting a worker. Ordinary dispatch continues using legacy seat controls until task identity propagation is connected (#2049).
@@ -83,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A root `Dockerfile` that runs the memory MCP server over stdio as a non-root user, plus `glama.json`; the image installs the latest `brigade-cli` release from PyPI (`--build-arg BRIGADE_VERSION=X.Y.Z` pins one), so MCP directories that build and introspect a repo image can list the servers.
 
 ### Changed
+
+- `brigade model trial run|resume` behavior changes for callers that set no new option. Check wrappers and CI that key on trial exit codes:
+  - A provider capacity response with a nonzero seat exit used to score as `execution_error` (exit 1). It is now `adapter_error` with `failure_reason: capacity-exhausted` (exit 3), and the per-seat stop is on by default, so the seat's remaining cells become `not_run`.
+  - `run` and `resume` now install SIGINT and SIGTERM handlers for the whole trial. The first signal drains instead of stopping the process. A second signal hard-stops it.
+  - Exit code 4 is new: the trial ended with `not_run` or `running` cells and no measurement failures.
 
 - The memory and skills MCP tools describe what they return and when to use them, and their input fields carry descriptions, so MCP clients and directories can pick the right tool.
 - The read-only MCP servers negotiate the protocol version (`2024-11-05`, `2025-03-26`, or `2025-06-18`) instead of always answering `2024-11-05`, answer `ping` with an empty result, return `-32600` for malformed requests, and report the Brigade version in `serverInfo`.
