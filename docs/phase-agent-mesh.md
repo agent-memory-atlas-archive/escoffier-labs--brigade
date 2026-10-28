@@ -759,7 +759,7 @@ itself is a no-op. Revocations are also cumulative: a later revocation
 statement can add revoked kids or move a `compromised_from` earlier, and
 cannot remove a revocation or move it later. Each revocation statement lists
 every revocation so far, so the latest one is complete, and a statement that
-drops an earlier entry is refused. These marks live in the key
+drops an earlier entry or changes its principal is refused. These marks live in the key
 directory with the pin store and follow the same file rules.
 
 ### Revision 5 signed statement contract
@@ -978,6 +978,35 @@ sealed to the key. A revocation statement signed with the manifest key carries
 the same information to no-hub contacts and to stations that do not trust the
 hub to report it. When a hub revocation and a signed statement disagree, the
 client uses the earlier `compromised_from`.
+
+Policy A, approved on 2026-10-27, retains principal names as attributed claims.
+An otherwise valid complete signed list is accepted when an older signer or
+an authenticated unsigned hub allegation names a different principal for a
+kid. Each `(hub, kid)` keeps the earliest cutoff and every principal's source
+attribution. Unsigned allegations keep a separate minimum per principal.
+A typed `kid_binding_conflict` records the disagreement in the same atomic
+generation as the accepted list, marks and barriers. Evidence exhaustion
+refuses the whole transaction without eviction. Within one signer's stream,
+omitting an earlier kid, changing its principal or moving its cutoff later
+still refuses the whole list. Replacing the signer starts an independent
+baseline, and reactivating a signer resumes its earlier baseline.
+
+Binding disagreements use ordinary storage, with up to 8192 groups bounded by
+the retained barriers. A separate table holds up to 4096 authenticated signer
+or floor conflicts. The operator approved up to 12,288 evidence records across
+the two tables, with the existing 56 MiB ordinary and 64 MiB total limits.
+Ordinary accounting includes binding groups and their source claims.
+Authenticated evidence can use the remaining total capacity. A new floor
+still needs ordinary storage and table headroom. Capacity refusal preserves
+the complete previous generation without dropping claims or evidence.
+Floor, barrier and unsigned-claim table limits are shared across hubs. Filling
+one table for one hub can prevent another hub's admission to that table.
+
+The internal `fleet_mesh_trust` library stores manifest anchors, membership,
+revocations, rollback floors and conflict evidence in one POSIX snapshot.
+It makes no peer-use decision and adds no key-manifest acceptance, identity
+pinning, migration, CLI or message integration. Future peer-use checks must
+consult the `(hub, kid)` revocation barrier without filtering by principal.
 
 Which mail from a revoked key stays readable. A thief can sign any
 `created_at`, and the order in which a station learns things proves nothing.
