@@ -183,12 +183,15 @@ def test_all_fleet_renderers_use_one_shared_shell_and_navigation(fleet_pages):
         for tag in ["style", "script"]:
             assert len(markup.elements(tag)) == 1, route
             assert markup.elements(tag)[0]["nonce"] == "integration-nonce", route
-        expected_nav = [{"class": "deck-nav", "aria-label": "Command Deck"}]
+        expected_nav = [
+            {"class": "deck-nav", "aria-label": "Command Deck"},
+            {"class": "section-tabs", "aria-label": "Section tabs"},
+        ]
         if route.startswith("/view/"):
             expected_nav.append({"class": "board-nav", "aria-label": "Board views"})
         assert markup.elements("nav") == expected_nav, route
         routes = {urlsplit(attrs["href"]).path for attrs in markup.elements("a") if "href" in attrs}
-        assert {"/deck/repos", "/deck/roster", "/deck/policy", "/view/machines"} <= routes, route
+        assert {"/deck/repos", "/deck/roster", "/view/machines"} <= routes, route
         assert "/" in routes or "/deck" in routes, route
 
 
@@ -371,17 +374,18 @@ def test_badge_icons_have_trusted_accessible_labels_without_inline_styles():
     assert [attrs["title"] for attrs in badges[-1:]] == [hostile]
 
 
-def test_populated_deck_orders_summary_alerts_work_and_machines():
+def test_populated_deck_orders_attention_activity_machines_and_queue():
     station = deck.StationView(
         deck.StationConfig("fixture-node", "Example", 2), "Example", True, 0, NOW.isoformat(), ()
     )
     view = deck.DeckView(stations=(station,), rail=(), repos=(), outcomes=(), observers=())
     rendered = deck.render_deck(view, nonce="spacing-nonce", now=NOW)
     markers = [
-        'aria-label="Fleet summary"',
-        'class="alert-line"',
-        'id="machines-table"',
+        'aria-labelledby="attention-title"',
         'aria-labelledby="working-title"',
+        'id="machines-table"',
+        'aria-label="Fleet summary"',
+        'aria-labelledby="queued-title"',
     ]
     positions = [rendered.index(marker) for marker in markers]
     assert positions == sorted(positions)

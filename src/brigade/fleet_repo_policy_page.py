@@ -18,8 +18,9 @@ repository editor on ``/deck/policy``, which stays the authoritative editor.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from urllib.parse import urlencode
 
 from . import fleet_command_deck, fleet_policy_page
 
@@ -100,6 +101,7 @@ class RepoPolicyRow:
     claim_owner: str = ""
     claim_ttl: str = ""
     live: tuple[LiveLine, ...] = ()
+    targets: tuple[str, ...] = ()
     sessions: tuple[SessionLine, ...] = ()
     verification: str = UNKNOWN
     flags: str = ""
@@ -178,6 +180,7 @@ def _coordination(deck_rows: list[fleet_command_deck.RepoRow]) -> dict:
         "claim_owner": fleet_command_deck._owner_text(claim) if claim is not None else "",
         "claim_ttl": f"{claim.ttl_remaining}s left" if claim is not None else "",
         "live": live,
+        "targets": tuple(sorted({row.target for row in deck_rows})),
         "flags": flags,
     }
 
@@ -241,6 +244,7 @@ def build_rows(
                     claim_owner=coordination["claim_owner"],
                     claim_ttl=coordination["claim_ttl"],
                     live=coordination["live"],
+                    targets=coordination["targets"],
                     sessions=_sessions_for(policy, repo.identity),
                     verification=UNKNOWN,
                     flags=coordination["flags"],
@@ -269,6 +273,7 @@ def build_rows(
                 claim_owner=coordination["claim_owner"],
                 claim_ttl=coordination["claim_ttl"],
                 live=coordination["live"],
+                targets=coordination["targets"],
                 flags=coordination["flags"],
             )
         )
@@ -349,6 +354,21 @@ def _row_html(row: RepoPolicyRow) -> str:
     )
 
 
+def _summary_card(row: RepoPolicyRow) -> str:
+    single_target = len(row.targets) == 1
+    href = "/view/repos?" + urlencode({"repo": row.targets[0]}) if single_target else "/view/repos"
+    link_label = "View runs" if single_target else "View all runs"
+    claim = f"Claim held · {row.claim_owner} · {row.claim_ttl}" if row.claim_owner else "No active claim"
+    flags = f'<p class="collision">{_esc(row.flags)}</p>' if row.flags else ""
+    linkage = '<p class="station-meta">Policy linkage unknown</p>' if not row.linked else ""
+    return (
+        '<article class="repository-card"><header>'
+        f'<h2>{_esc(row.label)}</h2><a class="card-link" href="{_esc(href)}">{link_label}</a></header>'
+        f"<p>{len(row.live)} reported run{'s' if len(row.live) != 1 else ''}</p>"
+        f'<p class="station-meta">{_esc(claim)}</p>{flags}{linkage}</article>'
+    )
+
+
 def render(
     view: fleet_command_deck.DeckView,
     *,
@@ -358,7 +378,7 @@ def render(
     nonce: str,
     now: datetime,
 ) -> str:
-    """The repos page: policy per repository, then the claim/run coordination table."""
+    """Repository summaries, with complete coordination and policy disclosures."""
     linked = sum(1 for row in rows if row.linked)
     if policy_available:
         state = (
@@ -372,19 +392,26 @@ def render(
             + ". Claim and run coordination below is unaffected.</p>"
         )
     blocks = "".join(_row_html(row) for row in rows) or '<p class="empty">No repositories to show.</p>'
+    # Policy can decorate current observations, but cannot create them.
+    linked_identities = {row.identity for row in rows if row.linked}
+    cards = "".join(
+        _summary_card(replace(row, linked=row.identity in linked_identities)) for row in build_rows(view, None)
+    )
+    if not cards:
+        cards = '<p class="empty">No repository observations available. <a href="/view/repos">View run history</a></p>'
     body = (
         '<main class="deck-shell"><header class="masthead"><div><p class="eyebrow">Fleet operations</p>'
-        "<h1>Command Deck &middot; Repos</h1></div>"
+        "<h1>Repositories</h1></div>"
         f'<p class="header-meta">{_esc(fleet_command_deck._stamp(now))}</p></header>'
-        '<section class="panel" aria-labelledby="repo-policy"><header>'
-        '<h2 id="repo-policy">Repository policy</h2>'
-        f'<p class="panel-count">{len(rows)} target(s)</p></header>'
-        f"{state}{blocks}</section>"
-        '<section class="repo-panel" aria-label="Repository coordination">'
-        "<h2>Claims and live runs</h2>"
+        '<section aria-label="Repository summaries"><div class="repository-grid">'
+        + cards
+        + "</div></section><details><summary>Claims and live runs</summary>"
         + fleet_command_deck.repo_coordination_table(view)
-        + '</section><footer><a href="/view/machines">machines board</a> '
-        '<a href="/view/repos">repos board</a></footer></main>'
+        + "</details><details><summary>Repository policy and metadata</summary>"
+        '<section class="panel" aria-labelledby="repo-policy"><header><h2 id="repo-policy">Repository policy</h2>'
+        f'<p class="panel-count">{len(rows)} target(s)</p></header>{state}{blocks}</section></details>'
+        '<footer><a href="/view/machines">Runs</a> <a href="/view/repos">Repository board</a> '
+        '<a href="/deck/ci">CI</a> <a href="/deck/owners">Ownership</a></footer></main>'
     )
     # No meta refresh: a 10-second reload would collapse every open repository
     # while an operator is reading it.
