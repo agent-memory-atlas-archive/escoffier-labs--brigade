@@ -66,3 +66,38 @@ protocol currently supply no assignment IDs. Until the owning integration
 adds those IDs, ordinary dispatch uses legacy worker slots. Journals, durable
 results, acceptance deduplication, parent delivery, wait semantics, T3 children,
 and cancellation containment remain integration work under #2046/#2049.
+
+
+## Durable task control requests
+
+Use `brigade runs steer <run> --task-id <task> [--attempt-id <attempt>] <text>`
+or `brigade runs interrupt <run> --task-id <task> [--attempt-id <attempt>]`.
+The positional worker form and `--worker <worker>` remain available. Worker
+and task selectors are mutually exclusive. Interrupt without a selector targets
+all active turns. The existing identifier bounds apply before journal mutation
+or transport delivery.
+
+Journal-backed requests record the requested task and optional attempt in their
+fingerprint. Reusing a request ID with different selectors conflicts. Replaying
+a recorded result restores those requested selectors without another send.
+A task-only request does not acquire an attempt selector from the provider's
+response. Its replay reports the requested task, without a resolved attempt.
+Successful targeted responses must explicitly identify the selected task and,
+when requested, the exact attempt. Missing or conflicting identity produces a
+protocol failure rather than acknowledged delivery. Task-targeted requests use
+distinct wire operations so older servers reject them before provider action.
+Legacy runs forward selectors without durable replay, with the same transport
+response identity checks.
+
+Task redaction remaps control selectors and paired request identities alongside
+task attempts and checkpoints. Aliases of recomputed spec, attempt, and result
+identities are remapped in related task/provider and control references, even
+outside the selected range. Selected control facts scrub private digests and
+turn references while preserving closed operation and failure classifications.
+For affected targeted controls, redaction refuses an invalid operation, unmatched
+durable task, or unmatched durable attempt before publishing any changes. Live controls
+may use external selectors, but redaction cannot safely remap those selectors
+without their durable history. Refusal preserves the original recoverable bytes
+and never substitutes a different attempt.
+An interrupt observation acknowledges delivery. Task completion, execution
+quiescence, and capacity release still require their own lifecycle evidence.
